@@ -1,15 +1,36 @@
 import json
 import os
+import time
+import logging
 from fastapi import FastAPI
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 from dotenv import load_dotenv
 from serpapi import GoogleSearch
 
 load_dotenv(dotenv_path=".env")
 
+logger = logging.getLogger("shopping_assistant")
+
 app = FastAPI(title="AI Shopping Assistant")
-client = OpenAI()
+
+# Network settings: fail fast instead of hanging, retry transient errors.
+OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "20"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
+SERPAPI_TIMEOUT_SECONDS = float(os.getenv("SERPAPI_TIMEOUT_SECONDS", "20"))
+SERPAPI_MAX_RETRIES = int(os.getenv("SERPAPI_MAX_RETRIES", "2"))
+
+_client = None
+
+
+def get_openai_client():
+    """Create the OpenAI client lazily so the app can start without a key."""
+    global _client
+    if _client is None:
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError("OPENAI_API_KEY is not set")
+        _client = OpenAI(timeout=OPENAI_TIMEOUT_SECONDS, max_retries=OPENAI_MAX_RETRIES)
+    return _client
 
 STATE_FILE = "session_state.json"
 
@@ -60,22 +81,37 @@ product, noise_preference, use_case, chemical_type, power_type, max_price.
 If unknown, use null.
 """
 
-    response = client.responses.create(
-        model="gpt-4.1-nano",
-        input=prompt
-    )
+    try:
+        response = get_openai_client().responses.create(
+            model="gpt-4.1-nano",
+            input=prompt
+        )
+    except (OpenAIError, RuntimeError) as e:
+        logger.warning("OpenAI extraction failed: %s", e)
+        return None
 
-    text = response.output_text.strip().replace("```json", "").replace("```", "").strip()
+    text = (response.output_text or "").strip().replace("```json", "").replace("```", "").strip()
+
+    # The model sometimes wraps JSON in extra prose; keep only the object.
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        text = text[start:end + 1]
 
     try:
-        return json.loads(text)
-    except Exception:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning("Could not parse extraction output: %r", text[:200])
         return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+ORDER_FIELDS = {"product", "noise_preference", "use_case", "chemical_type", "power_type", "max_price"}
 
 
 def merge_order(order, extracted):
     for key, value in extracted.items():
-        if value not in [None, "", [], {}]:
+        if key in ORDER_FIELDS and value not in [None, "", [], {}]:
             order[key] = value
     return order
 
@@ -138,17 +174,43 @@ What maximum budget do you want me to use?
 
 
 def search_amazon_with_serpapi(order):
-    query = f"{order.get('noise_preference')} {order.get('chemical_type')} {order.get('power_type')} {order.get('product')} under {order.get('max_price')}"
+    parts = [order.get(k) for k in ("noise_preference", "chemical_type", "power_type", "product")]
+    query = " ".join(str(p) for p in parts if p)
+    if order.get("max_price"):
+        query += f" under {order.get('max_price')}"
+
+    api_key = os.getenv("SERPAPI_KEY")
+    if not api_key:
+        return "Product search is unavailable: SERPAPI_KEY is not set on the server."
 
     params = {
         "engine": "amazon",
         "k": query,
         "amazon_domain": "amazon.com",
-        "api_key": os.getenv("SERPAPI_KEY")
+        "api_key": api_key
     }
 
-    search = GoogleSearch(params)
-    results = search.get_dict()
+    results = None
+    last_error = None
+    for attempt in range(1, SERPAPI_MAX_RETRIES + 2):
+        try:
+            search = GoogleSearch(params)
+            search.timeout = SERPAPI_TIMEOUT_SECONDS
+            results = search.get_dict()
+            break
+        except Exception as e:  # network errors, timeouts, bad JSON
+            last_error = e
+            logger.warning("SerpAPI attempt %d failed: %s", attempt, e)
+            if attempt <= SERPAPI_MAX_RETRIES:
+                time.sleep(min(2 ** (attempt - 1), 8))
+
+    if results is None:
+        return f"Product search failed due to a network problem ({type(last_error).__name__}). Please try again."
+
+    if results.get("error"):
+        logger.warning("SerpAPI returned an error: %s", results["error"])
+        return f"Product search failed: {results['error']}"
+
     products = results.get("organic_results", [])
 
     if not products:
@@ -208,6 +270,11 @@ def chat(body: RequestBody):
     order = state["current_order"]
 
     extracted = extract_info(body.command, order)
+    if extracted is None:
+        return {
+            "reply": "I couldn't reach the AI service just now. Please try again in a moment.",
+            "current_order": order
+        }
     order = merge_order(order, extracted)
 
     missing = ask_missing(order)
